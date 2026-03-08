@@ -1,6 +1,7 @@
 """
 ⛏ TAMBANG BOT — Telegram Bot untuk Tambang Pasir
 Fitur: Laporan harian, notifikasi, input operator, tanya data (AI)
+v2 — Multi-owner support
 """
 
 import os, logging, asyncio, json
@@ -26,11 +27,19 @@ logging.basicConfig(
 log = logging.getLogger("tambang-bot")
 
 # ── CONFIG ──────────────────────────────────────────────────────
-BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
-SUPA_URL     = os.getenv("SUPABASE_URL", "https://tqmqdrifrbvupkrufecc.supabase.co")
-SUPA_KEY     = os.getenv("SUPABASE_KEY", "sb_publishable_bQTJDIyQYhx6P3Wljt82JA_gJmnFud1")
-OWNER_CHAT   = int(os.getenv("OWNER_CHAT_ID", "0"))   # isi chat ID kamu
-ANTHROPIC_KEY= os.getenv("ANTHROPIC_API_KEY", "")
+BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
+SUPA_URL      = os.getenv("SUPABASE_URL", "https://tqmqdrifrbvupkrufecc.supabase.co")
+SUPA_KEY      = os.getenv("SUPABASE_KEY", "sb_publishable_bQTJDIyQYhx6P3Wljt82JA_gJmnFud1")
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# Multi-owner: OWNER_CHAT_ID bisa diisi lebih dari 1, pisah koma
+# Contoh: "1953642141,8117718091"
+_raw_owners = os.getenv("OWNER_CHAT_ID", "")
+OWNER_CHATS  = set(int(x.strip()) for x in _raw_owners.split(",") if x.strip())
+
+# Operator IDs (non-owner)
+_raw_ops     = os.getenv("OPERATOR_IDS", "")
+OPERATOR_IDS = set(int(x.strip()) for x in _raw_ops.split(",") if x.strip())
 
 HEADERS = {
     "apikey": SUPA_KEY,
@@ -38,9 +47,6 @@ HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "return=representation"
 }
-
-# Role mapping — tambah Telegram user ID operator di sini
-OPERATOR_IDS = set(map(int, os.getenv("OPERATOR_IDS", "").split(",") if os.getenv("OPERATOR_IDS") else []))
 
 # Conversation states
 (ASK_UNIT, ASK_SOLAR_L, ASK_SOLAR_HARGA, ASK_SERVICE_UNIT,
@@ -71,14 +77,6 @@ def rp(n) -> str:
     try: return f"Rp {int(n):,}".replace(",", ".")
     except: return "Rp 0"
 
-def emoji_status(val, good_thresh=0, warn_thresh=None) -> str:
-    try:
-        v = float(val)
-        if v > good_thresh: return "✅"
-        if warn_thresh and v > warn_thresh: return "⚠️"
-        return "🔴"
-    except: return "❓"
-
 def now_str() -> str:
     return datetime.now().strftime("%d/%m/%Y %H:%M")
 
@@ -87,26 +85,35 @@ def today_str() -> str:
 
 # ── ACCESS CHECK ─────────────────────────────────────────────────
 def is_owner(uid: int) -> bool:
-    return uid == OWNER_CHAT
+    return uid in OWNER_CHATS
 
 def is_authorized(uid: int) -> bool:
-    return uid == OWNER_CHAT or uid in OPERATOR_IDS
+    return uid in OWNER_CHATS or uid in OPERATOR_IDS
+
+async def notify_owners(bot, sender_uid: int, text: str):
+    """Kirim notifikasi ke semua owner kecuali si pengirim sendiri."""
+    for oc in OWNER_CHATS:
+        if oc != sender_uid:
+            try:
+                await bot.send_message(oc, text, parse_mode="Markdown")
+            except Exception as e:
+                log.warning(f"Gagal notif owner {oc}: {e}")
 
 # ── LAPORAN BUILDER ──────────────────────────────────────────────
 async def build_daily_report() -> str:
     today = date.today().isoformat()
 
-    units     = await supa_get("units", "select=id,name,status,jam_operasi")
-    solar     = await supa_get("solar_logs", f"select=*&created_at=gte.{today}")
-    services  = await supa_get("service_logs", f"select=*&created_at=gte.{today}")
-    spares    = await supa_get("spare_stock", "select=*&qty=lt.5")
-    costs     = await supa_get("cost_logs", f"select=*&created_at=gte.{today}")
+    units    = await supa_get("units",        "select=id,name,status,jam_operasi")
+    solar    = await supa_get("solar_logs",   f"select=*&created_at=gte.{today}")
+    services = await supa_get("service_logs", f"select=*&created_at=gte.{today}")
+    spares   = await supa_get("spare_stock",  "select=*&qty=lt.5")
+    costs    = await supa_get("cost_logs",    f"select=*&created_at=gte.{today}")
 
-    total_solar_l   = sum(s.get("liter", 0) for s in solar)
-    total_solar_rp  = sum(s.get("liter", 0) * s.get("harga_per_liter", 9800) for s in solar)
-    total_service   = sum(s.get("biaya", 0) for s in services)
-    total_biaya     = sum(c.get("jumlah", 0) for c in costs)
-    unit_aktif      = sum(1 for u in units if u.get("status") == "aktif")
+    total_solar_l  = sum(s.get("liter", 0) for s in solar)
+    total_solar_rp = sum(s.get("liter", 0) * s.get("harga_per_liter", 9800) for s in solar)
+    total_service  = sum(s.get("biaya", 0) for s in services)
+    total_biaya    = sum(c.get("jumlah", 0) for c in costs)
+    unit_aktif     = sum(1 for u in units if u.get("status") == "aktif")
 
     lines = [
         f"⛏ *LAPORAN HARIAN TAMBANG*",
@@ -144,7 +151,7 @@ async def build_maintenance_alerts() -> str:
     units = await supa_get("units", "select=id,name,jam_operasi,next_service_jam")
     alerts = []
     for u in units:
-        jam = u.get("jam_operasi", 0) or 0
+        jam    = u.get("jam_operasi", 0) or 0
         next_s = u.get("next_service_jam", 0) or 0
         if next_s > 0:
             sisa = next_s - jam
@@ -154,10 +161,23 @@ async def build_maintenance_alerts() -> str:
                 alerts.append(f"⚠️ *{u['name']}* — sisa `{int(sisa)} jam` lagi")
     return "\n".join(alerts) if alerts else "✅ Semua unit dalam kondisi baik"
 
-# ── COMMANDS ─────────────────────────────────────────────────────
+# ── OWNER KEYBOARD ───────────────────────────────────────────────
+def owner_keyboard():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("📊 Laporan Hari Ini"), KeyboardButton("🔔 Cek Maintenance")],
+        [KeyboardButton("💰 Ringkasan Biaya"),  KeyboardButton("🚛 Status Unit")],
+        [KeyboardButton("📦 Cek Stok Spare"),   KeyboardButton("🤖 Tanya AI")],
+    ], resize_keyboard=True)
 
+def operator_keyboard():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("⛽ Input Solar"),      KeyboardButton("🔧 Input Service")],
+        [KeyboardButton("📦 Input Spare Part"), KeyboardButton("📊 Laporan Hari Ini")],
+    ], resize_keyboard=True)
+
+# ── COMMANDS ─────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid  = update.effective_user.id
     name = update.effective_user.first_name
 
     if not is_authorized(uid):
@@ -168,21 +188,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    role = "👑 Owner" if is_owner(uid) else "👷 Operator"
+    role   = "👑 Owner" if is_owner(uid) else "👷 Operator"
+    markup = owner_keyboard() if is_owner(uid) else operator_keyboard()
 
-    if is_owner(uid):
-        keyboard = [
-            [KeyboardButton("📊 Laporan Hari Ini"), KeyboardButton("🔔 Cek Maintenance")],
-            [KeyboardButton("💰 Ringkasan Biaya"),  KeyboardButton("🚛 Status Unit")],
-            [KeyboardButton("📦 Cek Stok Spare"),   KeyboardButton("🤖 Tanya AI")],
-        ]
-    else:
-        keyboard = [
-            [KeyboardButton("⛽ Input Solar"),      KeyboardButton("🔧 Input Service")],
-            [KeyboardButton("📦 Input Spare Part"), KeyboardButton("📊 Laporan Hari Ini")],
-        ]
-
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
         f"⛏ *Selamat datang, {name}!*\n"
         f"Role: {role}\n\n"
@@ -194,7 +202,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_laporan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return
-    msg = await update.message.reply_text("⏳ Mengambil data...")
+    msg    = await update.message.reply_text("⏳ Mengambil data...")
     report = await build_daily_report()
     await msg.edit_text(report, parse_mode="Markdown")
 
@@ -202,7 +210,7 @@ async def cmd_maintenance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("🚫 Fitur ini hanya untuk owner.")
         return
-    msg = await update.message.reply_text("⏳ Cek jadwal maintenance...")
+    msg    = await update.message.reply_text("⏳ Cek jadwal maintenance...")
     alerts = await build_maintenance_alerts()
     await msg.edit_text(
         f"🔧 *STATUS MAINTENANCE*\n📅 {today_str()}\n\n{alerts}",
@@ -219,11 +227,10 @@ async def cmd_units(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["🚛 *STATUS UNIT & ARMADA*\n"]
     for u in units:
         status = u.get("status", "unknown")
-        icon = {"aktif":"🟢","rusak":"🔴","maintenance":"🟡"}.get(status, "⚪")
+        icon   = {"aktif": "🟢", "rusak": "🔴", "maintenance": "🟡"}.get(status, "⚪")
         lines.append(
             f"{icon} *{u.get('name','?')}*\n"
-            f"   Jam: `{u.get('jam_operasi',0):,}` jam  |  "
-            f"Status: `{status}`"
+            f"   Jam: `{u.get('jam_operasi',0):,}` jam  |  Status: `{status}`"
         )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -236,7 +243,7 @@ async def cmd_stok(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["📦 *STOK SPARE PART*\n"]
     for s in stok:
-        qty = s.get("qty", 0)
+        qty  = s.get("qty", 0)
         icon = "🔴" if qty < 3 else "⚠️" if qty < 5 else "✅"
         lines.append(f"{icon} {s.get('nama','?')}: `{qty} {s.get('satuan','')}`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -245,15 +252,15 @@ async def cmd_biaya(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("🚫 Fitur ini hanya untuk owner.")
         return
-    today = date.today().isoformat()
+    today   = date.today().isoformat()
     solar   = await supa_get("solar_logs",   f"select=*&created_at=gte.{today}")
     service = await supa_get("service_logs", f"select=*&created_at=gte.{today}")
     costs   = await supa_get("cost_logs",    f"select=*&created_at=gte.{today}")
 
-    total_solar  = sum(s.get("liter",0) * s.get("harga_per_liter",9800) for s in solar)
-    total_svc    = sum(s.get("biaya",0) for s in service)
-    total_lain   = sum(c.get("jumlah",0) for c in costs)
-    grand_total  = total_solar + total_svc + total_lain
+    total_solar = sum(s.get("liter", 0) * s.get("harga_per_liter", 9800) for s in solar)
+    total_svc   = sum(s.get("biaya", 0) for s in service)
+    total_lain  = sum(c.get("jumlah", 0) for c in costs)
+    grand_total = total_solar + total_svc + total_lain
 
     await update.message.reply_text(
         f"💰 *RINGKASAN BIAYA HARI INI*\n📅 {today_str()}\n\n"
@@ -286,8 +293,8 @@ async def solar_got_unit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     unit_id = q.data.replace("unit_", "")
-    units = ctx.user_data.get("units", [])
-    unit = next((u for u in units if str(u["id"]) == unit_id), None)
+    units   = ctx.user_data.get("units", [])
+    unit    = next((u for u in units if str(u["id"]) == unit_id), None)
     ctx.user_data["solar_unit_id"]   = unit_id
     ctx.user_data["solar_unit_name"] = unit["name"] if unit else "?"
     await q.edit_message_text(
@@ -323,36 +330,32 @@ async def solar_skip_harga(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _save_solar(update: Update, ctx: ContextTypes.DEFAULT_TYPE, harga: float):
     liter  = ctx.user_data.get("solar_liter", 0)
     uid    = str(update.effective_user.id)
-    result = await supa_post("solar_logs", {
-        "unit_id":        ctx.user_data.get("solar_unit_id"),
-        "liter":          liter,
+    await supa_post("solar_logs", {
+        "unit_id":         ctx.user_data.get("solar_unit_id"),
+        "liter":           liter,
         "harga_per_liter": harga,
-        "operator_id":    uid,
-        "created_at":     datetime.now().isoformat()
+        "operator_id":     uid,
+        "created_at":      datetime.now().isoformat()
     })
     total = liter * harga
-    msg = (
+    await update.message.reply_text(
         f"✅ *Solar tersimpan!*\n\n"
         f"🚛 Unit: {ctx.user_data.get('solar_unit_name')}\n"
         f"⛽ Liter: `{liter:,.0f} L`\n"
         f"💵 Harga: `{rp(harga)}/L`\n"
         f"💰 Total: `{rp(total)}`\n\n"
-        f"_Data tersimpan ke cloud_ ✓"
+        f"_Data tersimpan ke cloud_ ✓",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
-    # Notif ke owner
-    if OWNER_CHAT and update.effective_user.id != OWNER_CHAT:
-        try:
-            name = update.effective_user.first_name
-            await ctx.bot.send_message(
-                OWNER_CHAT,
-                f"🔔 *Input Solar Baru*\n"
-                f"Oleh: {name}\n"
-                f"Unit: {ctx.user_data.get('solar_unit_name')}\n"
-                f"Solar: {liter:,.0f} L = {rp(total)}",
-                parse_mode="Markdown"
-            )
-        except: pass
+    name = update.effective_user.first_name
+    await notify_owners(
+        ctx.bot,
+        update.effective_user.id,
+        f"🔔 *Input Solar Baru*\n"
+        f"Oleh: {name}\n"
+        f"Unit: {ctx.user_data.get('solar_unit_name')}\n"
+        f"Solar: {liter:,.0f} L = {rp(total)}"
+    )
 
 # ── INPUT SERVICE (Conversation) ──────────────────────────────────
 async def service_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -371,8 +374,8 @@ async def service_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def service_got_unit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     unit_id = q.data.replace("svc_", "")
-    units = ctx.user_data.get("units", [])
-    unit = next((u for u in units if str(u["id"]) == unit_id), None)
+    units   = ctx.user_data.get("units", [])
+    unit    = next((u for u in units if str(u["id"]) == unit_id), None)
     ctx.user_data["svc_unit_id"]   = unit_id
     ctx.user_data["svc_unit_name"] = unit["name"] if unit else "?"
     buttons = [
@@ -391,7 +394,10 @@ async def service_got_unit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def service_got_jenis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    jenis_map = {"ringan":"Servis Ringan","sedang":"Servis Sedang","besar":"Servis Besar","overhaul":"Overhaul","lain":"Perbaikan/Lain"}
+    jenis_map = {
+        "ringan": "Servis Ringan", "sedang": "Servis Sedang",
+        "besar":  "Servis Besar",  "overhaul": "Overhaul", "lain": "Perbaikan/Lain"
+    }
     jenis = q.data.replace("jenis_", "")
     ctx.user_data["svc_jenis"] = jenis_map.get(jenis, jenis)
     await q.edit_message_text(
@@ -402,7 +408,11 @@ async def service_got_jenis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def service_got_biaya(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
-        biaya = float(update.message.text.replace(".", "").replace(",", "").replace("rp","").replace("Rp","").strip())
+        biaya = float(
+            update.message.text
+            .replace(".", "").replace(",", "")
+            .replace("rp", "").replace("Rp", "").strip()
+        )
     except:
         await update.message.reply_text("❌ Format salah. Contoh: 500000")
         return ASK_SERVICE_BIAYA
@@ -415,26 +425,24 @@ async def service_got_biaya(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "operator_id": uid,
         "created_at": datetime.now().isoformat()
     })
-    msg = (
+    await update.message.reply_text(
         f"✅ *Service tersimpan!*\n\n"
         f"🚛 Unit: {ctx.user_data.get('svc_unit_name')}\n"
         f"🔧 Jenis: {ctx.user_data.get('svc_jenis')}\n"
         f"💰 Biaya: `{rp(biaya)}`\n\n"
-        f"_Data tersimpan ke cloud_ ✓"
+        f"_Data tersimpan ke cloud_ ✓",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
-    if OWNER_CHAT and update.effective_user.id != OWNER_CHAT:
-        try:
-            name = update.effective_user.first_name
-            await ctx.bot.send_message(
-                OWNER_CHAT,
-                f"🔔 *Input Service Baru*\nOleh: {name}\n"
-                f"Unit: {ctx.user_data.get('svc_unit_name')}\n"
-                f"Jenis: {ctx.user_data.get('svc_jenis')}\n"
-                f"Biaya: {rp(biaya)}",
-                parse_mode="Markdown"
-            )
-        except: pass
+    name = update.effective_user.first_name
+    await notify_owners(
+        ctx.bot,
+        update.effective_user.id,
+        f"🔔 *Input Service Baru*\n"
+        f"Oleh: {name}\n"
+        f"Unit: {ctx.user_data.get('svc_unit_name')}\n"
+        f"Jenis: {ctx.user_data.get('svc_jenis')}\n"
+        f"Biaya: {rp(biaya)}"
+    )
     return ConversationHandler.END
 
 # ── INPUT SPARE PART ──────────────────────────────────────────────
@@ -466,7 +474,6 @@ async def spare_got_satuan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     nama   = ctx.user_data.get("spare_nama")
     qty    = ctx.user_data.get("spare_qty", 0)
 
-    # Cek apakah sudah ada di stok
     existing = await supa_get("spare_stock", f"select=*&nama=eq.{nama}&limit=1")
     if existing:
         new_qty = (existing[0].get("qty") or 0) + qty
@@ -489,7 +496,7 @@ async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Input dibatalkan.")
     return ConversationHandler.END
 
-# ── AI CHAT (natural language query) ─────────────────────────────
+# ── AI CHAT ──────────────────────────────────────────────────────
 async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("🚫 Fitur AI hanya untuk owner.")
@@ -517,14 +524,13 @@ async def handle_ai_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("🤖 Menganalisa data...")
 
-    # Ambil data konteks
-    units   = await supa_get("units",       "select=*")
-    solar   = await supa_get("solar_logs",  "select=*&order=created_at.desc&limit=50")
-    service = await supa_get("service_logs","select=*&order=created_at.desc&limit=50")
-    stok    = await supa_get("spare_stock", "select=*")
+    units   = await supa_get("units",        "select=*")
+    solar   = await supa_get("solar_logs",   "select=*&order=created_at.desc&limit=50")
+    service = await supa_get("service_logs", "select=*&order=created_at.desc&limit=50")
+    stok    = await supa_get("spare_stock",  "select=*")
 
     context = f"""
-Kamu adalah asisten keuangan dan operasional untuk tambang pasir.
+Kamu adalah asisten keuangan dan operasional untuk tambang pasir bernama SCRAPERS.
 Berikut data real-time dari sistem:
 
 UNITS: {json.dumps(units, ensure_ascii=False)}
@@ -536,8 +542,7 @@ Jawab pertanyaan owner dengan ringkas, dalam Bahasa Indonesia.
 Gunakan format yang mudah dibaca di Telegram (tanpa markdown kompleks).
 Berikan insight yang berguna jika relevan.
 """
-
-    client = Anthropic(api_key=ANTHROPIC_KEY)
+    client   = Anthropic(api_key=ANTHROPIC_KEY)
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=500,
@@ -557,7 +562,6 @@ async def route_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text
 
-    # Owner AI mode
     if ctx.user_data.get("ai_mode") and is_owner(update.effective_user.id):
         await handle_ai_query(update, ctx)
         return
@@ -575,45 +579,56 @@ async def route_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── SCHEDULED JOBS ────────────────────────────────────────────────
 async def job_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
-    """Kirim laporan harian setiap pagi jam 06:00"""
-    if not OWNER_CHAT: return
+    """Laporan harian ke semua owner — 06:00 WIB"""
+    if not OWNER_CHATS: return
     report = await build_daily_report()
-    await ctx.bot.send_message(OWNER_CHAT, report, parse_mode="Markdown")
-    log.info("Daily report sent to owner")
+    for oc in OWNER_CHATS:
+        try:
+            await ctx.bot.send_message(oc, report, parse_mode="Markdown")
+        except Exception as e:
+            log.warning(f"Gagal kirim laporan ke {oc}: {e}")
+    log.info(f"Daily report sent to {len(OWNER_CHATS)} owner(s)")
 
 async def job_maintenance_check(ctx: ContextTypes.DEFAULT_TYPE):
-    """Cek maintenance setiap hari jam 07:00"""
-    if not OWNER_CHAT: return
+    """Alert maintenance — 07:00 WIB"""
+    if not OWNER_CHATS: return
     alerts = await build_maintenance_alerts()
     if "🔴" in alerts or "⚠️" in alerts:
-        await ctx.bot.send_message(
-            OWNER_CHAT,
-            f"🔔 *PERINGATAN MAINTENANCE*\n\n{alerts}",
-            parse_mode="Markdown"
-        )
+        for oc in OWNER_CHATS:
+            try:
+                await ctx.bot.send_message(
+                    oc,
+                    f"🔔 *PERINGATAN MAINTENANCE*\n\n{alerts}",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                log.warning(f"Gagal kirim maintenance alert ke {oc}: {e}")
 
 async def job_stok_check(ctx: ContextTypes.DEFAULT_TYPE):
-    """Cek stok menipis setiap hari jam 08:00"""
-    if not OWNER_CHAT: return
+    """Alert stok kritis — 08:00 WIB"""
+    if not OWNER_CHATS: return
     spares = await supa_get("spare_stock", "select=*&qty=lt.3")
     if spares:
         lines = ["⚠️ *STOK HABIS / KRITIS*\n"]
         for s in spares:
             lines.append(f"🔴 {s.get('nama')}: `{s.get('qty')} {s.get('satuan')}`")
-        await ctx.bot.send_message(
-            OWNER_CHAT,
-            "\n".join(lines),
-            parse_mode="Markdown"
-        )
+        text = "\n".join(lines)
+        for oc in OWNER_CHATS:
+            try:
+                await ctx.bot.send_message(oc, text, parse_mode="Markdown")
+            except Exception as e:
+                log.warning(f"Gagal kirim stok alert ke {oc}: {e}")
 
 # ── MAIN ──────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN tidak ditemukan di .env!")
 
+    log.info(f"Owner IDs: {OWNER_CHATS}")
+    log.info(f"Operator IDs: {OPERATOR_IDS}")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Solar conversation
     solar_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^⛽ Input Solar$"), solar_start)],
         states={
@@ -627,7 +642,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_conv)]
     )
 
-    # Service conversation
     service_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔧 Input Service$"), service_start)],
         states={
@@ -638,7 +652,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_conv)]
     )
 
-    # Spare part conversation
     spare_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📦 Input Spare Part$"), spare_start)],
         states={
@@ -649,25 +662,24 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_conv)]
     )
 
-    # Register handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("laporan", cmd_laporan))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("laporan",     cmd_laporan))
     app.add_handler(CommandHandler("maintenance", cmd_maintenance))
-    app.add_handler(CommandHandler("units", cmd_units))
-    app.add_handler(CommandHandler("stok", cmd_stok))
-    app.add_handler(CommandHandler("biaya", cmd_biaya))
-    app.add_handler(CommandHandler("ai", cmd_ai))
-    app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("units",       cmd_units))
+    app.add_handler(CommandHandler("stok",        cmd_stok))
+    app.add_handler(CommandHandler("biaya",       cmd_biaya))
+    app.add_handler(CommandHandler("ai",          cmd_ai))
+    app.add_handler(CommandHandler("done",        cmd_done))
     app.add_handler(solar_conv)
     app.add_handler(service_conv)
     app.add_handler(spare_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_message))
 
-    # Scheduled jobs (waktu dalam UTC — WIB = UTC+7, jadi jam 6 WIB = jam 23 UTC hari sebelumnya)
-    job_queue = app.job_queue
-    job_queue.run_daily(job_daily_report,     time=__import__("datetime").time(23, 0, 0))  # 06:00 WIB
-    job_queue.run_daily(job_maintenance_check,time=__import__("datetime").time(0,  0, 0))  # 07:00 WIB
-    job_queue.run_daily(job_stok_check,       time=__import__("datetime").time(1,  0, 0))  # 08:00 WIB
+    # Scheduled — WIB = UTC+7
+    jq = app.job_queue
+    jq.run_daily(job_daily_report,      time=__import__("datetime").time(23, 0, 0))  # 06:00 WIB
+    jq.run_daily(job_maintenance_check, time=__import__("datetime").time(0,  0, 0))  # 07:00 WIB
+    jq.run_daily(job_stok_check,        time=__import__("datetime").time(1,  0, 0))  # 08:00 WIB
 
     log.info("🤖 Tambang Bot started!")
     app.run_polling(drop_pending_updates=True)
