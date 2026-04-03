@@ -1,7 +1,7 @@
 """
 ⛏ TAMBANG BOT — Telegram Bot untuk Tambang Pasir
 Fitur: Laporan harian, notifikasi, input operator, tanya data (AI)
-v2 — Multi-owner support
+v2 — Multi-owner support + Agentic AI (Tool Use)
 """
 
 import os, logging, asyncio, json
@@ -17,7 +17,9 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters,
     ConversationHandler
 )
-from anthropic import Anthropic
+
+# IMPORT ENGINE AI DARI FILE SEBELAH
+from ai_tools import chat_with_claude
 
 load_dotenv()
 logging.basicConfig(
@@ -33,7 +35,6 @@ SUPA_KEY      = os.getenv("SUPABASE_KEY", "sb_publishable_bQTJDIyQYhx6P3Wljt82JA
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 # Multi-owner: OWNER_CHAT_ID bisa diisi lebih dari 1, pisah koma
-# Contoh: "1953642141,8117718091"
 _raw_owners = os.getenv("OWNER_CHAT_ID", "")
 OWNER_CHATS  = set(int(x.strip()) for x in _raw_owners.split(",") if x.strip())
 
@@ -120,7 +121,7 @@ async def build_daily_report() -> str:
     total_solar_l  = sum(s.get("liter", 0) for s in solar)
     total_solar_rp = sum(s.get("liter", 0) * s.get("harga_per_liter", 9800) for s in solar)
     total_service  = sum(s.get("biaya", 0) for s in services)
-    total_biaya    = sum(c.get("jumlah", 0) for c in costs)
+    total_biaya    = sum(c.get("amount", 0) for c in costs) # DISESUAIKAN DENGAN STRUKTUR DB LO
     unit_aktif     = sum(1 for u in units if u.get("status") == "aktif")
 
     lines = [
@@ -277,7 +278,7 @@ async def cmd_biaya(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         total_solar = sum((s.get("liter") or 0) * (s.get("harga_per_liter") or 9800) for s in solar)
         total_svc   = sum(s.get("biaya") or 0 for s in service)
-        total_lain  = sum(c.get("jumlah") or 0 for c in costs)
+        total_lain  = sum(c.get("amount") or 0 for c in costs) # DISESUAIKAN
         grand_total = total_solar + total_svc + total_lain
 
         await update.message.reply_text(
@@ -517,7 +518,7 @@ async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Input dibatalkan.")
     return ConversationHandler.END
 
-# ── AI CHAT ──────────────────────────────────────────────────────
+# ── AI CHAT (VERSI BARU DENGAN TOOL USE) ─────────────────────────
 async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("🚫 Fitur AI hanya untuk owner.")
@@ -526,9 +527,8 @@ async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🤖 *Mode Tanya AI aktif!*\n\n"
         "Ketik pertanyaan apapun tentang tambang kamu.\n"
         "Contoh:\n"
-        "• _Berapa total biaya solar minggu ini?_\n"
-        "• _Unit mana yang paling sering service?_\n"
-        "• _Stok apa yang hampir habis?_\n\n"
+        "• _Coba cek di database, ada biaya apa aja di cost_logs minggu ini?_\n"
+        "• _Berapa total solar yang dikeluarin hari ini?_\n\n"
         "Ketik /done untuk kembali ke menu.",
         parse_mode="Markdown"
     )
@@ -543,35 +543,15 @@ async def handle_ai_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ API key AI belum dikonfigurasi.")
         return
 
-    msg = await update.message.reply_text("🤖 Menganalisa data...")
+    msg = await update.message.reply_text("🤖 Sebentar bos, lagi ngecek data...")
 
-    units   = await supa_get("units",        "select=*")
-    solar   = await supa_get("solar_logs",   "select=*&order=created_at.desc&limit=50")
-    service = await supa_get("service_logs", "select=*&order=created_at.desc&limit=50")
-    stok    = await supa_get("spare_stock",  "select=*")
-
-    context = f"""
-Kamu adalah asisten keuangan dan operasional untuk tambang pasir bernama SCRAPERS.
-Berikut data real-time dari sistem:
-
-UNITS: {json.dumps(units, ensure_ascii=False)}
-SOLAR LOGS (50 terbaru): {json.dumps(solar, ensure_ascii=False)}
-SERVICE LOGS (50 terbaru): {json.dumps(service, ensure_ascii=False)}
-SPARE STOCK: {json.dumps(stok, ensure_ascii=False)}
-
-Jawab pertanyaan owner dengan ringkas, dalam Bahasa Indonesia.
-Gunakan format yang mudah dibaca di Telegram (tanpa markdown kompleks).
-Berikan insight yang berguna jika relevan.
-"""
-    client   = Anthropic(api_key=ANTHROPIC_KEY)
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=500,
-        system=context,
-        messages=[{"role": "user", "content": question}]
-    )
-    answer = response.content[0].text
-    await msg.edit_text(f"🤖 *AI:*\n\n{answer}", parse_mode="Markdown")
+    try:
+        # Manggil engine AI cerdas yang udah kita pisahin ke file ai_tools.py
+        answer = await asyncio.to_thread(chat_with_claude, question, ANTHROPIC_KEY)
+        await msg.edit_text(f"🤖 *AI:*\n\n{answer}", parse_mode="Markdown")
+    except Exception as e:
+        log.error(f"Error AI: {e}")
+        await msg.edit_text("⚠️ Waduh bos, AI-nya lagi pusing. Coba tanya ulang atau cek log error.")
 
 async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["ai_mode"] = False
