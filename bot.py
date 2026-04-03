@@ -1,140 +1,104 @@
-"""
-⛏ TAMBANG BOT — Telegram Bot untuk Tambang Pasir
-Fitur: Laporan harian, notifikasi, input operator, tanya data (AI)
-"""
-
-import os, logging, asyncio, json
+import os, logging
 from datetime import datetime, date
 from dotenv import load_dotenv
 import httpx
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton
-)
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
-    ConversationHandler
-)
-
-from ai_tools import chat_with_claude
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 load_dotenv()
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("tambang-bot")
 
-BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
-SUPA_URL      = os.getenv("SUPABASE_URL")
-SUPA_KEY      = os.getenv("SUPABASE_KEY")
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# CONFIG DASAR
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SUPA_URL = os.getenv("SUPABASE_URL")
+SUPA_KEY = os.getenv("SUPABASE_KEY")
 
 _raw_owners = os.getenv("OWNER_CHAT_ID", "")
-OWNER_CHATS  = set(int(x.strip()) for x in _raw_owners.split(",") if x.strip())
-
-_raw_ops     = os.getenv("OPERATOR_IDS", "")
-OPERATOR_IDS = set(int(x.strip()) for x in _raw_ops.split(",") if x.strip())
+OWNER_CHATS = set(int(x.strip()) for x in _raw_owners.split(",") if x.strip())
 
 HEADERS = {
     "apikey": SUPA_KEY,
     "Authorization": f"Bearer {SUPA_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation"
+    "Content-Type": "application/json"
 }
 
-(ASK_UNIT, ASK_SOLAR_L, ASK_SOLAR_HARGA, ASK_SERVICE_UNIT,
- ASK_SERVICE_JENIS, ASK_SERVICE_BIAYA, ASK_SPARE_NAMA,
- ASK_SPARE_QTY, ASK_SPARE_SATUAN) = range(9)
+def rp(n): return f"Rp {int(n):,}".replace(",", ".")
 
 async def supa_get(table: str, params: str = "") -> list:
     url = f"{SUPA_URL}/rest/v1/{table}?{params}"
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(url, headers=HEADERS)
-            data = r.json()
-            if r.status_code == 200 and isinstance(data, list):
-                return data
-            return []
+            if r.status_code == 200: return r.json()
     except Exception as e:
-        log.error(f"supa_get error {table}: {e}")
-        return []
+        log.error(f"Error Supabase: {e}")
+    return []
 
-async def supa_post(table: str, data: dict) -> dict | None:
-    url = f"{SUPA_URL}/rest/v1/{table}"
-    async with httpx.AsyncClient() as c:
-        r = await c.post(url, headers=HEADERS, json=data)
-        return r.json()[0] if r.status_code in [200, 201] else None
+# BIKIN LAPORAN
+async def build_daily_report() -> str:
+    today = date.today().isoformat()
+    solar = await supa_get("solar_logs", f"select=*&created_at=gte.{today}")
+    services = await supa_get("service_logs", f"select=*&created_at=gte.{today}")
+    costs = await supa_get("cost_logs", f"select=*&created_at=gte.{today}")
 
-async def supa_patch(table: str, match: str, data: dict) -> bool:
-    url = f"{SUPA_URL}/rest/v1/{table}?{match}"
-    async with httpx.AsyncClient() as c:
-        r = await c.patch(url, headers=HEADERS, json=data)
-        return r.status_code in [200, 204]
+    total_solar_l = sum(s.get("liter", 0) for s in solar)
+    total_solar_rp = sum(s.get("liter", 0) * s.get("harga_per_liter", 9800) for s in solar)
+    total_service = sum(s.get("biaya", 0) for s in services)
+    total_biaya = sum(c.get("amount", 0) for c in costs)
+    grand_total = total_solar_rp + total_service + total_biaya
 
-def is_owner(uid: int) -> bool: return uid in OWNER_CHATS
-def is_authorized(uid: int) -> bool: return uid in OWNER_CHATS or uid in OPERATOR_IDS
+    return (
+        f"⛏ *LAPORAN HARIAN TAMBANG*\n"
+        f"📅 {date.today().strftime('%d %B %Y')}\n"
+        f"────────────────────────\n\n"
+        f"⛽ *SOLAR*: {total_solar_l:,.0f} L ({rp(total_solar_rp)})\n"
+        f"🔧 *SERVICE*: {len(services)} kali ({rp(total_service)})\n"
+        f"📋 *LAINNYA*: {rp(total_biaya)}\n\n"
+        f"💰 *TOTAL HARI INI: {rp(grand_total)}*\n"
+    )
 
+# MENU UTAMA
 def owner_keyboard():
     return ReplyKeyboardMarkup([
-        [KeyboardButton("📊 Laporan Hari Ini"), KeyboardButton("🔔 Cek Maintenance")],
-        [KeyboardButton("💰 Ringkasan Biaya"),  KeyboardButton("🚛 Status Unit")],
-        [KeyboardButton("📦 Cek Stok Spare"),   KeyboardButton("🤖 Tanya AI")],
-    ], resize_keyboard=True)
-
-def operator_keyboard():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("⛽ Input Solar"),      KeyboardButton("🔧 Input Service")],
-        [KeyboardButton("📦 Input Spare Part"), KeyboardButton("📊 Laporan Hari Ini")],
+        [KeyboardButton("📊 Laporan Hari Ini"), KeyboardButton("💰 Ringkasan Biaya")],
     ], resize_keyboard=True)
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_authorized(uid):
+    if uid not in OWNER_CHATS:
         await update.message.reply_text("🚫 Akses ditolak.")
         return
-    markup = owner_keyboard() if is_owner(uid) else operator_keyboard()
-    await update.message.reply_text("⛏ *Selamat datang!*\nPilih menu di bawah 👇", parse_mode="Markdown", reply_markup=markup)
+    await update.message.reply_text("⛏ *Sistem Online!*\nPilih menu di bawah 👇", parse_mode="Markdown", reply_markup=owner_keyboard())
 
-async def cmd_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id): return
-    await update.message.reply_text("🤖 *Mode Tanya AI aktif!*\nKetik pertanyaan apapun tentang tambang kamu.\nKetik /done untuk kembali.", parse_mode="Markdown")
-    ctx.user_data["ai_mode"] = True
-
-async def handle_ai_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update.effective_user.id): return
-    if not ctx.user_data.get("ai_mode"): return
-
-    question = update.message.text
-    if not ANTHROPIC_KEY:
-        await update.message.reply_text("⚠️ API key AI belum dikonfigurasi.")
-        return
-
-    msg = await update.message.reply_text("🤖 Sebentar bos, lagi ngecek data...")
-    try:
-        answer = await asyncio.to_thread(chat_with_claude, question, ANTHROPIC_KEY)
-        await msg.edit_text(f"🤖 *AI:*\n\n{answer}", parse_mode="Markdown")
-    except Exception as e:
-        log.error(f"Error AI: {e}")
-        await msg.edit_text("⚠️ Waduh bos, AI-nya lagi pusing.")
-
-async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["ai_mode"] = False
-    await update.message.reply_text("✅ Kembali ke menu utama.")
+async def cmd_laporan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in OWNER_CHATS: return
+    msg = await update.message.reply_text("⏳ Narik data dari server...")
+    report = await build_daily_report()
+    await msg.edit_text(report, parse_mode="Markdown")
 
 async def route_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id): return
-    if ctx.user_data.get("ai_mode") and is_owner(update.effective_user.id):
-        await handle_ai_query(update, ctx)
-        return
+    text = update.message.text
+    if text == "📊 Laporan Hari Ini" or text == "💰 Ringkasan Biaya":
+        await cmd_laporan(update, ctx)
+
+# JADWAL OTOMATIS
+async def job_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
+    if not OWNER_CHATS: return
+    report = await build_daily_report()
+    for oc in OWNER_CHATS:
+        try: await ctx.bot.send_message(oc, report, parse_mode="Markdown")
+        except: pass
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ai", cmd_ai))
-    app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_message))
+    
+    # Laporan jam 23:00 UTC (06:00 WIB)
+    app.job_queue.run_daily(job_daily_report, time=__import__("datetime").time(23, 0, 0))
+    
+    log.info("BOT REBORN STARTING...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
