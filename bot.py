@@ -1,5 +1,5 @@
 """
-⛏ TAMBANG BOT — Versi Final (Jadwal 10 Menitan)
+⛏ TAMBANG BOT — Versi Final (Gemini AI Edition)
 Fitur: Laporan harian, Maintenance Alert, Stok Alert, AI Agent
 Jadwal: 06:00 (Laporan), 06:10 (Maint), 06:20 (Stok) WIB
 """
@@ -18,17 +18,16 @@ from telegram.ext import (
     ConversationHandler
 )
 
-from ai_tools import chat_with_claude
+from ai_tools import chat_with_gemini
 
 load_dotenv()
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("tambang-bot")
 
-# ── CONFIG ──────────────────────────────────────────────────────
-BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
-SUPA_URL      = os.getenv("SUPABASE_URL")
-SUPA_KEY      = os.getenv("SUPABASE_KEY")
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+SUPA_URL   = os.getenv("SUPABASE_URL")
+SUPA_KEY   = os.getenv("SUPABASE_KEY")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 
 _raw_owners = os.getenv("OWNER_CHAT_ID", "")
 OWNER_CHATS  = set(int(x.strip()) for x in _raw_owners.split(",") if x.strip())
@@ -40,7 +39,6 @@ HEADERS = {
     "Prefer": "return=representation"
 }
 
-# ── SUPABASE HELPERS ────────────────────────────────────────────
 async def supa_get(table: str, params: str = "") -> list:
     url = f"{SUPA_URL}/rest/v1/{table}?{params}"
     try:
@@ -50,11 +48,9 @@ async def supa_get(table: str, params: str = "") -> list:
             return []
     except: return []
 
-# ── FORMATTERS ──────────────────────────────────────────────────
 def rp(n): return f"Rp {int(n):,}".replace(",", ".")
 def today_str(): return date.today().strftime("%d %B %Y")
 
-# ── LAPORAN & ALERT BUILDER ─────────────────────────────────────
 async def build_daily_report() -> str:
     today = date.today().isoformat()
     solar = await supa_get("solar_logs", f"select=*&created_at=gte.{today}")
@@ -85,7 +81,6 @@ async def build_maintenance_alerts() -> str:
         elif sisa <= 50: alerts.append(f"⚠️ *{u['name']}* — sisa `{int(sisa)} jam` lagi")
     return "\n".join(alerts) if alerts else "✅ Semua unit aman."
 
-# ── SCHEDULED JOBS ──────────────────────────────────────────────
 async def job_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
     report = await build_daily_report()
     for oc in OWNER_CHATS:
@@ -107,7 +102,6 @@ async def job_stok_check(ctx: ContextTypes.DEFAULT_TYPE):
             try: await ctx.bot.send_message(oc, text, parse_mode="Markdown")
             except: pass
 
-# ── HANDLERS ────────────────────────────────────────────────────
 def owner_keyboard():
     return ReplyKeyboardMarkup([
         [KeyboardButton("📊 Laporan Hari Ini"), KeyboardButton("🔔 Cek Maintenance")],
@@ -124,8 +118,11 @@ async def route_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if ctx.user_data.get("ai_mode"):
+        if not GEMINI_KEY:
+            await update.message.reply_text("⚠️ API Key Gemini belum diisi di Railway.")
+            return
         msg = await update.message.reply_text("🤖 Sebentar bos...")
-        answer = await asyncio.to_thread(chat_with_claude, text, ANTHROPIC_KEY)
+        answer = await asyncio.to_thread(chat_with_gemini, text, GEMINI_KEY)
         await msg.edit_text(f"🤖 *AI:*\n\n{answer}", parse_mode="Markdown")
         return
 
@@ -144,14 +141,13 @@ def main():
     app.add_handler(CommandHandler("done", lambda u, c: (c.user_data.update({"ai_mode": False}), u.message.reply_text("✅ Keluar mode AI"))))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_message))
 
-    # Setup Jadwal (WIB = UTC+7)
     jq = app.job_queue
-    jq.run_daily(job_daily_report,      time=time(23, 0, 0)) # Jam 06:00 WIB
-    jq.run_daily(job_maintenance_check, time=time(23, 10, 0)) # Jam 06:10 WIB
-    jq.run_daily(job_stok_check,        time=time(23, 20, 0)) # Jam 06:20 WIB
+    jq.run_daily(job_daily_report,      time=time(23, 0, 0)) # 06:00 WIB
+    jq.run_daily(job_maintenance_check, time=time(23, 10, 0)) # 06:10 WIB
+    jq.run_daily(job_stok_check,        time=time(23, 20, 0)) # 06:20 WIB
 
-    log.info("🤖 Bot Full Version Started!")
-    app.run_polling()
+    log.info("🤖 Bot Gemini Version Started!")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
