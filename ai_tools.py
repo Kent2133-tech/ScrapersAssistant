@@ -24,7 +24,7 @@ def fetch_supabase_data(table_name: str, limit: int = 50):
 def chat_with_gemini(question: str, api_key: str):
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-pro')
         
         # AI bakal nyedot data ini dulu sebelum ngejawab pertanyaan lo
         units = fetch_supabase_data("units", 10)
