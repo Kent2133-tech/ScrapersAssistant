@@ -24,7 +24,15 @@ def fetch_supabase_data(table_name: str, limit: int = 50):
 def chat_with_gemini(question: str, api_key: str):
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-pro')
+        
+        # JURUS SAKTI: Suruh sistem nyari sendiri model apa yang tersedia di API Key ini
+        tersedia = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        if not tersedia:
+            return "Waduh error: API Key lu nggak punya akses ke model teks Google satupun."
+            
+        # Pake model pertama yang ketemu dari daftar resmi Google
+        model = genai.GenerativeModel(tersedia[0])
         
         # AI bakal nyedot data ini dulu sebelum ngejawab pertanyaan lo
         units = fetch_supabase_data("units", 10)
